@@ -14,7 +14,7 @@ Metadata:
       - Label: { default: "Network (outbound only)" }
         Parameters: [VpcId, SubnetIds, IngestEndpoint, IngestHost, EgressCidr]
       - Label: { default: "Telemetry the Edge may read" }
-        Parameters: [CloudTrailBucket, CloudTrailPrefix, WafBucket, WafPrefix, AlbBucket, AlbPrefix, VpcFlowBucket, VpcFlowPrefix, GuardDutyDetectorId, CloudWatchLogGroupName, EnableIamMetadata, EnableComputeMetadata]
+        Parameters: [CreateCloudTrail, CloudTrailBucket, CloudTrailPrefix, WafBucket, WafPrefix, AlbBucket, AlbPrefix, VpcFlowBucket, VpcFlowPrefix, GuardDutyDetectorId, CloudWatchLogGroupName, EnableIamMetadata, EnableComputeMetadata]
       - Label: { default: "Privacy ceiling" }
         Parameters: [MaxPrivacyMode, EnabledSources]
 
@@ -40,8 +40,16 @@ Parameters:
   IngestEndpoint: { Type: String, Default: "https://ingest.inwom.com", AllowedPattern: "^https://[a-z0-9.-]+$" }
   IngestHost: { Type: String, Default: ingest.inwom.com, AllowedPattern: "^[a-z0-9.-]+$" }
   EgressCidr: { Type: String, Default: 0.0.0.0/0, Description: Destination for outbound 443. Narrow to your NAT/firewall or Inwom's published ranges. }
-  CloudTrailBucket: { Type: String, Default: "" }
-  CloudTrailPrefix: { Type: String, Default: "", Description: "e.g. AWSLogs/123456789012/CloudTrail/us-east-1/{yyyy}/{mm}/{dd}/" }
+  CreateCloudTrail:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      If CloudTrailBucket below is left blank, create a small dedicated CloudTrail trail (management events
+      only, 30-day retention) so the Edge has something to read out of the box. Set to "false" to skip
+      CloudTrail entirely instead of auto-creating one.
+  CloudTrailBucket: { Type: String, Default: "", Description: "Leave blank to have Inwom create its own dedicated trail (see CreateCloudTrail above). Set this only if you want the Edge to read an existing trail of yours instead." }
+  CloudTrailPrefix: { Type: String, Default: "", Description: "Only used together with a CloudTrailBucket you provided yourself, e.g. AWSLogs/123456789012/CloudTrail/us-east-1/{yyyy}/{mm}/{dd}/" }
   WafBucket: { Type: String, Default: "" }
   WafPrefix: { Type: String, Default: "" }
   AlbBucket: { Type: String, Default: "" }
@@ -63,7 +71,9 @@ Parameters:
   PermissionsBoundaryArn: { Type: String, Default: "" }
 
 Conditions:
-  HasCloudTrail: !Not [!Equals [!Ref CloudTrailBucket, ""]]
+  HasOwnCloudTrailBucket: !Not [!Equals [!Ref CloudTrailBucket, ""]]
+  AutoCreateCloudTrail: !And [!Equals [!Ref CloudTrailBucket, ""], !Equals [!Ref CreateCloudTrail, "true"]]
+  HasCloudTrail: !Or [!Condition HasOwnCloudTrailBucket, !Condition AutoCreateCloudTrail]
   HasWaf: !Not [!Equals [!Ref WafBucket, ""]]
   HasAlb: !Not [!Equals [!Ref AlbBucket, ""]]
   HasVpcFlow: !Not [!Equals [!Ref VpcFlowBucket, ""]]
@@ -140,6 +150,70 @@ Resources:
       Description: Single-use Inwom Edge registration token (spent after first registration).
       SecretString: !Ref BootstrapToken
 
+  # Only created when the customer left CloudTrailBucket blank (see CreateCloudTrail) -- mirrors
+  # infra/aws-adversarial-lab/cloudtrail.tf: a dedicated, minimal, management-events-only trail so
+  # "Deploy to AWS" works out of the box without the customer needing to already have one.
+  EdgeCloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Condition: AutoCreateCloudTrail
+    Properties:
+      BucketEncryption: { ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }] }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-logs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
+
+  EdgeCloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: AutoCreateCloudTrail
+    Properties:
+      Bucket: !Ref EdgeCloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${EdgeCloudTrailBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${EdgeCloudTrailBucket}/*"
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: "s3:GetBucketAcl"
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${EdgeCloudTrailBucket}"
+            Condition: { StringEquals: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-edge" } }
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: "s3:PutObject"
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${EdgeCloudTrailBucket}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": bucket-owner-full-control
+                "aws:SourceArn": !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-edge"
+
+  EdgeCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: AutoCreateCloudTrail
+    DependsOn: EdgeCloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${AWS::StackName}-edge"
+      S3BucketName: !Ref EdgeCloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+
   TaskRole:
     Type: AWS::IAM::Role
     Properties:
@@ -162,7 +236,7 @@ Resources:
                   Effect: Allow
                   Action: ["s3:ListBucket"]
                   Resource:
-                    - !If [HasCloudTrail, !Sub "arn:${AWS::Partition}:s3:::${CloudTrailBucket}", !Ref "AWS::NoValue"]
+                    - !If [HasCloudTrail, !Sub ["arn:${AWS::Partition}:s3:::${Bucket}", { Bucket: !If [AutoCreateCloudTrail, !Ref EdgeCloudTrailBucket, !Ref CloudTrailBucket] }], !Ref "AWS::NoValue"]
                     - !If [HasWaf, !Sub "arn:${AWS::Partition}:s3:::${WafBucket}", !Ref "AWS::NoValue"]
                     - !If [HasAlb, !Sub "arn:${AWS::Partition}:s3:::${AlbBucket}", !Ref "AWS::NoValue"]
                     - !If [HasVpcFlow, !Sub "arn:${AWS::Partition}:s3:::${VpcFlowBucket}", !Ref "AWS::NoValue"]
@@ -173,7 +247,7 @@ Resources:
                   Effect: Allow
                   Action: ["s3:GetObject"]
                   Resource:
-                    - !If [HasCloudTrail, !Sub "arn:${AWS::Partition}:s3:::${CloudTrailBucket}/*", !Ref "AWS::NoValue"]
+                    - !If [HasCloudTrail, !Sub ["arn:${AWS::Partition}:s3:::${Bucket}/*", { Bucket: !If [AutoCreateCloudTrail, !Ref EdgeCloudTrailBucket, !Ref CloudTrailBucket] }], !Ref "AWS::NoValue"]
                     - !If [HasWaf, !Sub "arn:${AWS::Partition}:s3:::${WafBucket}/*", !Ref "AWS::NoValue"]
                     - !If [HasAlb, !Sub "arn:${AWS::Partition}:s3:::${AlbBucket}/*", !Ref "AWS::NoValue"]
                     - !If [HasVpcFlow, !Sub "arn:${AWS::Partition}:s3:::${VpcFlowBucket}/*", !Ref "AWS::NoValue"]
@@ -319,8 +393,8 @@ Resources:
                 - >-
                   {"tenant_id":"${InwomTenantId}","environment_id":"${InwomEnvironmentId}","max_privacy_mode":"${MaxPrivacyMode}",
                   "allowed_sources":["${Sources}"],"ingest_endpoint":"${IngestEndpoint}","allowed_egress_hosts":["${IngestHost}"],
-                  "config_signing_public_keys":["${ConfigSigningPublicKey}"],"source_locations":{"cloudtrail_bucket":"${CloudTrailBucket}",
-                  "cloudtrail_prefixes":["${CloudTrailPrefix}"],"waf_bucket":"${WafBucket}","waf_prefixes":["${WafPrefix}"],
+                  "config_signing_public_keys":["${ConfigSigningPublicKey}"],"source_locations":{"cloudtrail_bucket":"${ResolvedCloudTrailBucket}",
+                  "cloudtrail_prefixes":["${ResolvedCloudTrailPrefix}"],"waf_bucket":"${WafBucket}","waf_prefixes":["${WafPrefix}"],
                   "alb_bucket":"${AlbBucket}","alb_prefixes":["${AlbPrefix}"],"vpc_flow_bucket":"${VpcFlowBucket}",
                   "vpc_flow_prefixes":["${VpcFlowPrefix}"],"guardduty_detector_id":"${GuardDutyDetectorId}",
                   "cloudwatch_log_groups":["${CloudWatchLogGroupName}"]},"kms_mac_key_id":"${PseudonymKeyArn}",
@@ -330,6 +404,8 @@ Resources:
                   PseudonymKeyArn: !GetAtt PseudonymKey.Arn
                   IdentityKeyArn: !GetAtt IdentityKey.Arn
                   QueueUrl: !Ref TransportQueue
+                  ResolvedCloudTrailBucket: !If [AutoCreateCloudTrail, !Ref EdgeCloudTrailBucket, !Ref CloudTrailBucket]
+                  ResolvedCloudTrailPrefix: !If [AutoCreateCloudTrail, !Sub "AWSLogs/${AWS::AccountId}/CloudTrail/", !Ref CloudTrailPrefix]
           Secrets:
             - { Name: INWOM_BOOTSTRAP_TOKEN, ValueFrom: !Ref BootstrapSecret }
           HealthCheck:
@@ -368,3 +444,7 @@ Outputs:
   IdentityKeyArn: { Value: !GetAtt IdentityKey.Arn }
   PseudonymKeyArn: { Value: !GetAtt PseudonymKey.Arn }
   DeployedImage: { Value: !Sub "${ImageRepository}@${ImageDigest}" }
+  AutoCreatedCloudTrailBucket:
+    Condition: AutoCreateCloudTrail
+    Value: !Ref EdgeCloudTrailBucket
+    Description: The CloudTrail bucket Inwom created for you (CloudTrailBucket was left blank).
