@@ -35,8 +35,8 @@ Parameters:
     AllowedPattern: "^sha256:[a-f0-9]{64}$"
     ConstraintDescription: An immutable digest (sha256:<64 hex>), not a tag.
   EcrRepositoryArn: { Type: String, Default: "", Description: Only if ImageRepository is your own ECR mirror. }
-  VpcId: { Type: AWS::EC2::VPC::Id }
-  SubnetIds: { Type: "List<AWS::EC2::Subnet::Id>", Description: PRIVATE subnets routed through your NAT / egress firewall. }
+  VpcId: { Type: AWS::EC2::VPC::Id, Description: "The VPC where the Edge should run. Not sure? Ask whoever manages your AWS account/network -- do not guess." }
+  SubnetIds: { Type: "List<AWS::EC2::Subnet::Id>", Description: "PRIVATE subnets only (no public IP, outbound via a NAT Gateway) -- often named/tagged 'private'. NOT the default VPC's subnets, which are public. Ask your cloud/IT team if you're not sure which ones qualify." }
   IngestEndpoint: { Type: String, Default: "https://ingest.inwom.com", AllowedPattern: "^https://[a-z0-9.-]+$" }
   IngestHost: { Type: String, Default: ingest.inwom.com, AllowedPattern: "^[a-z0-9.-]+$" }
   EgressCidr: { Type: String, Default: 0.0.0.0/0, Description: Destination for outbound 443. Narrow to your NAT/firewall or Inwom's published ranges. }
