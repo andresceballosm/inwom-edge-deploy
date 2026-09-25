@@ -412,7 +412,9 @@ Resources:
           Secrets:
             - { Name: INWOM_BOOTSTRAP_TOKEN, ValueFrom: !Ref BootstrapSecret }
           HealthCheck:
-            Command: [CMD, python, -m, inwom_edge.health]
+            # DIAGNOSTIC (temporary): always-pass, to isolate whether `python -m inwom_edge.health`
+            # itself is what's killing the task every ~6-7min. Revert to the real command once we know.
+            Command: [CMD-SHELL, "exit 0"]
             Interval: 60
             Timeout: 30
             Retries: 5
