@@ -1,0 +1,368 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Inwom Edge V1 - outbound-only, read-only security sensor (ECS Fargate). No inbound rules, no public IP,
+  no SSH, no shell. Equivalent to deploy/aws/terraform/inwom-edge; IAM is constrained by
+  deploy/security/iam_matrix.yaml (enforced by CI).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Inwom identity (from the dashboard)" }
+        Parameters: [InwomTenantId, InwomEnvironmentId, BootstrapToken, ConfigSigningPublicKey]
+      - Label: { default: "Image (immutable, by digest)" }
+        Parameters: [ImageRepository, ImageDigest, EcrRepositoryArn]
+      - Label: { default: "Network (outbound only)" }
+        Parameters: [VpcId, SubnetIds, IngestEndpoint, IngestHost, EgressCidr]
+      - Label: { default: "Telemetry the Edge may read" }
+        Parameters: [CloudTrailBucket, CloudTrailPrefix, WafBucket, WafPrefix, AlbBucket, AlbPrefix, VpcFlowBucket, VpcFlowPrefix, GuardDutyDetectorId, CloudWatchLogGroupName, EnableIamMetadata, EnableComputeMetadata]
+      - Label: { default: "Privacy ceiling" }
+        Parameters: [MaxPrivacyMode, EnabledSources]
+
+Parameters:
+  InwomTenantId: { Type: String, AllowedPattern: "^ten_[a-z0-9]{8,40}$" }
+  InwomEnvironmentId: { Type: String, AllowedPattern: "^env_[a-z0-9]{8,40}$" }
+  BootstrapToken:
+    Type: String
+    NoEcho: true
+    Description: Single-use registration token (valid 1 hour). Spent after first registration.
+  ConfigSigningPublicKey:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9_-]{60,200}$"
+    Description: Inwom config-signing public key (base64url SPKI DER) from the dashboard. Pinned; never fetched at runtime.
+  ImageRepository: { Type: String, Default: ghcr.io/andresceballosm/inwom-edge }
+  ImageDigest:
+    Type: String
+    AllowedPattern: "^sha256:[a-f0-9]{64}$"
+    ConstraintDescription: An immutable digest (sha256:<64 hex>), not a tag.
+  EcrRepositoryArn: { Type: String, Default: "", Description: Only if ImageRepository is your own ECR mirror. }
+  VpcId: { Type: AWS::EC2::VPC::Id }
+  SubnetIds: { Type: "List<AWS::EC2::Subnet::Id>", Description: PRIVATE subnets routed through your NAT / egress firewall. }
+  IngestEndpoint: { Type: String, Default: "https://ingest.inwom.com", AllowedPattern: "^https://[a-z0-9.-]+$" }
+  IngestHost: { Type: String, Default: ingest.inwom.com, AllowedPattern: "^[a-z0-9.-]+$" }
+  EgressCidr: { Type: String, Default: 0.0.0.0/0, Description: Destination for outbound 443. Narrow to your NAT/firewall or Inwom's published ranges. }
+  CloudTrailBucket: { Type: String, Default: "" }
+  CloudTrailPrefix: { Type: String, Default: "", Description: "e.g. AWSLogs/123456789012/CloudTrail/us-east-1/{yyyy}/{mm}/{dd}/" }
+  WafBucket: { Type: String, Default: "" }
+  WafPrefix: { Type: String, Default: "" }
+  AlbBucket: { Type: String, Default: "" }
+  AlbPrefix: { Type: String, Default: "" }
+  VpcFlowBucket: { Type: String, Default: "" }
+  VpcFlowPrefix: { Type: String, Default: "" }
+  GuardDutyDetectorId: { Type: String, Default: "" }
+  CloudWatchLogGroupName: { Type: String, Default: "" }
+  EnableIamMetadata: { Type: String, Default: "false", AllowedValues: ["true", "false"] }
+  EnableComputeMetadata: { Type: String, Default: "false", AllowedValues: ["true", "false"] }
+  EnabledSources:
+    Type: CommaDelimitedList
+    Default: CLOUDTRAIL
+    Description: >-
+      Any of CLOUDTRAIL, WAF, ALB, VPC_FLOW, GUARDDUTY, CLOUDWATCH, IAM_METADATA, COMPUTE_METADATA. A source is only read if
+      it is listed here AND you granted its data location above (unknown values make the Edge refuse to start).
+  MaxPrivacyMode: { Type: String, Default: STRICT, AllowedValues: [STRICT, STANDARD] }
+  LogRetentionDays: { Type: Number, Default: 30 }
+  PermissionsBoundaryArn: { Type: String, Default: "" }
+
+Conditions:
+  HasCloudTrail: !Not [!Equals [!Ref CloudTrailBucket, ""]]
+  HasWaf: !Not [!Equals [!Ref WafBucket, ""]]
+  HasAlb: !Not [!Equals [!Ref AlbBucket, ""]]
+  HasVpcFlow: !Not [!Equals [!Ref VpcFlowBucket, ""]]
+  HasGuardDuty: !Not [!Equals [!Ref GuardDutyDetectorId, ""]]
+  HasLogGroup: !Not [!Equals [!Ref CloudWatchLogGroupName, ""]]
+  HasIam: !Equals [!Ref EnableIamMetadata, "true"]
+  HasCompute: !Equals [!Ref EnableComputeMetadata, "true"]
+  HasEcr: !Not [!Equals [!Ref EcrRepositoryArn, ""]]
+  HasBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
+  HasAnyS3: !Or [!Condition HasCloudTrail, !Condition HasWaf, !Condition HasAlb, !Condition HasVpcFlow]
+
+Resources:
+  PseudonymKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Inwom Edge pseudonymization + spool key derivation (HMAC, non-exportable)
+      KeySpec: HMAC_256
+      KeyUsage: GENERATE_VERIFY_MAC
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+
+  IdentityKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Inwom Edge installation identity (ECDSA P-256, non-exportable)
+      KeySpec: ECC_NIST_P256
+      KeyUsage: SIGN_VERIFY
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+
+  # Edge-owned transport queue: the only SQS resource the runtime role may touch.
+  TransportDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  TransportQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 120
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TransportDeadLetterQueue.Arn
+        maxReceiveCount: 20
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/inwom/${AWS::StackName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  BootstrapSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/bootstrap-token"
+      Description: Single-use Inwom Edge registration token (spent after first registration).
+      SecretString: !Ref BootstrapToken
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref "AWS::NoValue"]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: "sts:AssumeRole"
+            Condition: { StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" } }
+      Policies:
+        - PolicyName: inwom-edge-task
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - !If
+                - HasAnyS3
+                - Sid: S3LogBucketsList
+                  Effect: Allow
+                  Action: ["s3:ListBucket"]
+                  Resource:
+                    - !If [HasCloudTrail, !Sub "arn:${AWS::Partition}:s3:::${CloudTrailBucket}", !Ref "AWS::NoValue"]
+                    - !If [HasWaf, !Sub "arn:${AWS::Partition}:s3:::${WafBucket}", !Ref "AWS::NoValue"]
+                    - !If [HasAlb, !Sub "arn:${AWS::Partition}:s3:::${AlbBucket}", !Ref "AWS::NoValue"]
+                    - !If [HasVpcFlow, !Sub "arn:${AWS::Partition}:s3:::${VpcFlowBucket}", !Ref "AWS::NoValue"]
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasAnyS3
+                - Sid: S3LogObjectsRead
+                  Effect: Allow
+                  Action: ["s3:GetObject"]
+                  Resource:
+                    - !If [HasCloudTrail, !Sub "arn:${AWS::Partition}:s3:::${CloudTrailBucket}/*", !Ref "AWS::NoValue"]
+                    - !If [HasWaf, !Sub "arn:${AWS::Partition}:s3:::${WafBucket}/*", !Ref "AWS::NoValue"]
+                    - !If [HasAlb, !Sub "arn:${AWS::Partition}:s3:::${AlbBucket}/*", !Ref "AWS::NoValue"]
+                    - !If [HasVpcFlow, !Sub "arn:${AWS::Partition}:s3:::${VpcFlowBucket}/*", !Ref "AWS::NoValue"]
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasGuardDuty
+                - Sid: GuardDutyFindingsRead
+                  Effect: Allow
+                  Action: ["guardduty:ListFindings", "guardduty:GetFindings"]
+                  Resource: !Sub "arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:detector/${GuardDutyDetectorId}"
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasLogGroup
+                - Sid: CloudWatchSignalCounts
+                  Effect: Allow
+                  Action: ["logs:FilterLogEvents"]
+                  Resource:
+                    - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CloudWatchLogGroupName}"
+                    - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CloudWatchLogGroupName}:*"
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasIam
+                - Sid: IamInventoryMetadata
+                  Effect: Allow
+                  Action: ["iam:ListUsers", "iam:ListMFADevices", "iam:ListAccessKeys"]
+                  Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*"
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasCompute
+                - Sid: ComputeExposureMetadataNoResourceLevel
+                  Effect: Allow
+                  Action: ["ec2:DescribeInstances", "eks:ListClusters", "ecs:ListClusters"]
+                  Resource: "*"
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasCompute
+                - Sid: ComputeExposureMetadataScoped
+                  Effect: Allow
+                  Action: ["eks:DescribeCluster", "ecs:ListServices", "ecs:DescribeServices"]
+                  Resource:
+                    - !Sub "arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*"
+                    - !Sub "arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:cluster/*"
+                    - !Sub "arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:service/*/*"
+                - !Ref "AWS::NoValue"
+              - Sid: OwnTransportQueueOnly
+                Effect: Allow
+                Action: ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"]
+                Resource: !GetAtt TransportQueue.Arn
+              - Sid: PseudonymKeyDerivationOnly
+                Effect: Allow
+                Action: ["kms:GenerateMac"]
+                Resource: !GetAtt PseudonymKey.Arn
+              - Sid: InstallationIdentityKeySignOnly
+                Effect: Allow
+                Action: ["kms:Sign", "kms:GetPublicKey"]
+                Resource: !GetAtt IdentityKey.Arn
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref "AWS::NoValue"]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: "sts:AssumeRole"
+            Condition: { StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" } }
+      Policies:
+        - PolicyName: inwom-edge-execution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: OwnLogGroupWriteOnly
+                Effect: Allow
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "${LogGroup.Arn}:*"
+              - Sid: BootstrapSecretReadOnly
+                Effect: Allow
+                Action: ["secretsmanager:GetSecretValue"]
+                Resource: !Ref BootstrapSecret
+              - !If
+                - HasEcr
+                - Sid: EcrAuthorizationToken
+                  Effect: Allow
+                  Action: ["ecr:GetAuthorizationToken"]
+                  Resource: "*"
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasEcr
+                - Sid: EcrPullPinnedImage
+                  Effect: Allow
+                  Action: ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"]
+                  Resource: !Ref EcrRepositoryArn
+                - !Ref "AWS::NoValue"
+
+  # No SecurityGroupIngress anywhere. Outbound: TCP 443 only.
+  EdgeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Inwom Edge - outbound-only. No inbound rules.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref EgressCidr, Description: HTTPS to Inwom ingest and AWS APIs }
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings: [{ Name: containerInsights, Value: enabled }]
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref AWS::StackName
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      EphemeralStorage: { SizeInGiB: 21 }
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      Volumes:
+        - Name: spool
+        - Name: tmp
+      ContainerDefinitions:
+        - Name: edge
+          Image: !Sub "${ImageRepository}@${ImageDigest}"
+          Essential: true
+          User: "10001:10001"
+          ReadonlyRootFilesystem: true
+          Privileged: false
+          LinuxParameters:
+            InitProcessEnabled: true
+            Capabilities: { Drop: [ALL] }
+          MountPoints:
+            - { SourceVolume: spool, ContainerPath: /spool, ReadOnly: false }
+            - { SourceVolume: tmp, ContainerPath: /tmp, ReadOnly: false }
+          Environment:
+            - { Name: PYTHONDONTWRITEBYTECODE, Value: "1" }
+            - Name: INWOM_EDGE_LOCAL_POLICY
+              Value: !Sub
+                - >-
+                  {"tenant_id":"${InwomTenantId}","environment_id":"${InwomEnvironmentId}","max_privacy_mode":"${MaxPrivacyMode}",
+                  "allowed_sources":["${Sources}"],"ingest_endpoint":"${IngestEndpoint}","allowed_egress_hosts":["${IngestHost}"],
+                  "config_signing_public_keys":["${ConfigSigningPublicKey}"],"source_locations":{"cloudtrail_bucket":"${CloudTrailBucket}",
+                  "cloudtrail_prefixes":["${CloudTrailPrefix}"],"waf_bucket":"${WafBucket}","waf_prefixes":["${WafPrefix}"],
+                  "alb_bucket":"${AlbBucket}","alb_prefixes":["${AlbPrefix}"],"vpc_flow_bucket":"${VpcFlowBucket}",
+                  "vpc_flow_prefixes":["${VpcFlowPrefix}"],"guardduty_detector_id":"${GuardDutyDetectorId}",
+                  "cloudwatch_log_groups":["${CloudWatchLogGroupName}"]},"kms_mac_key_id":"${PseudonymKeyArn}",
+                  "kms_signing_key_id":"${IdentityKeyArn}","spool_dir":"/spool","spool_max_bytes":8589934592,
+                  "durable_queue_url":"${QueueUrl}"}
+                - Sources: !Join ['","', !Ref EnabledSources]
+                  PseudonymKeyArn: !GetAtt PseudonymKey.Arn
+                  IdentityKeyArn: !GetAtt IdentityKey.Arn
+                  QueueUrl: !Ref TransportQueue
+          Secrets:
+            - { Name: INWOM_BOOTSTRAP_TOKEN, ValueFrom: !Ref BootstrapSecret }
+          HealthCheck:
+            Command: [CMD, python, -m, inwom_edge.health]
+            Interval: 60
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 120
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: edge
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      EnableExecuteCommand: false
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref EdgeSecurityGroup]
+
+Outputs:
+  SecurityGroupId: { Value: !Ref EdgeSecurityGroup, Description: Edge security group (no ingress rules) }
+  IdentityKeyArn: { Value: !GetAtt IdentityKey.Arn }
+  PseudonymKeyArn: { Value: !GetAtt PseudonymKey.Arn }
+  DeployedImage: { Value: !Sub "${ImageRepository}@${ImageDigest}" }
