@@ -17,6 +17,8 @@ Metadata:
         Parameters: [CreateCloudTrail, CloudTrailBucket, CloudTrailPrefix, WafBucket, WafPrefix, AlbBucket, AlbPrefix, VpcFlowBucket, VpcFlowPrefix, GuardDutyDetectorId, CloudWatchLogGroupName, EnableIamMetadata, EnableComputeMetadata]
       - Label: { default: "Privacy ceiling" }
         Parameters: [MaxPrivacyMode, EnabledSources]
+      - Label: { default: "What matters to you (strongly recommended)" }
+        Parameters: [ProtectedResourceIdentifier, ProtectedResourceClassification, ProtectedResourceBoundary]
 
 Parameters:
   InwomTenantId: { Type: String, AllowedPattern: "^ten_[a-z0-9]{8,40}$" }
@@ -67,6 +69,27 @@ Parameters:
       Any of CLOUDTRAIL, WAF, ALB, VPC_FLOW, GUARDDUTY, CLOUDWATCH, IAM_METADATA, COMPUTE_METADATA. A source is only read if
       it is listed here AND you granted its data location above (unknown values make the Edge refuse to start).
   MaxPrivacyMode: { Type: String, Default: STRICT, AllowedValues: [STRICT, STANDARD] }
+  ProtectedResourceIdentifier:
+    Type: String
+    Default: ""
+    Description: >-
+      Ask yourself: "if someone outside my company read this, would it actually worry me?" That's
+      usually an S3 BUCKET NAME holding customer data, backups or financial records -- type just the
+      bucket name (e.g. my-company-customer-data). If what worries you more is an AWS ROLE with
+      admin/full access, paste its full ARN instead (e.g. arn:aws:iam::<your account id>:role/Admin). Only
+      that name/ARN is sent here -- the Edge tokenizes it locally and Inwom never learns what it is.
+      Leaving this blank does NOT make your account safer: Inwom stays connected either way, but it
+      will never be able to tell you about anything, because it has no way to know what matters to you.
+  ProtectedResourceClassification:
+    Type: String
+    Default: PROTECTED
+    AllowedValues: [PROTECTED, RESTRICTED]
+    Description: How sensitive it is. RESTRICTED is the more sensitive tier -- use it for something like an admin role.
+  ProtectedResourceBoundary:
+    Type: String
+    Default: DATA
+    AllowedValues: [DATA, PRIVILEGE, IDENTITY, EXECUTION, SECRET]
+    Description: What kind of thing it is. DATA for a bucket/database holding sensitive data. PRIVILEGE for a role that grants elevated access.
   LogRetentionDays: { Type: Number, Default: 30 }
   PermissionsBoundaryArn: { Type: String, Default: "" }
 
@@ -78,6 +101,7 @@ Conditions:
   HasAlb: !Not [!Equals [!Ref AlbBucket, ""]]
   HasVpcFlow: !Not [!Equals [!Ref VpcFlowBucket, ""]]
   HasGuardDuty: !Not [!Equals [!Ref GuardDutyDetectorId, ""]]
+  HasProtectedResource: !Not [!Equals [!Ref ProtectedResourceIdentifier, ""]]
   HasLogGroup: !Not [!Equals [!Ref CloudWatchLogGroupName, ""]]
   HasIam: !Equals [!Ref EnableIamMetadata, "true"]
   HasCompute: !Equals [!Ref EnableComputeMetadata, "true"]
@@ -402,13 +426,17 @@ Resources:
                   "vpc_flow_prefixes":["${VpcFlowPrefix}"],"guardduty_detector_id":"${GuardDutyDetectorId}",
                   "cloudwatch_log_groups":["${CloudWatchLogGroupName}"]},"kms_mac_key_id":"${PseudonymKeyArn}",
                   "kms_signing_key_id":"${IdentityKeyArn}","spool_dir":"/spool","spool_max_bytes":8589934592,
-                  "durable_queue_url":"${QueueUrl}"}
+                  "durable_queue_url":"${QueueUrl}","protected_resources":${ResolvedProtectedResources}}
                 - Sources: !Join ['","', !Ref EnabledSources]
                   PseudonymKeyArn: !GetAtt PseudonymKey.Arn
                   IdentityKeyArn: !GetAtt IdentityKey.Arn
                   QueueUrl: !Ref TransportQueue
                   ResolvedCloudTrailBucket: !If [AutoCreateCloudTrail, !Ref EdgeCloudTrailBucket, !Ref CloudTrailBucket]
                   ResolvedCloudTrailPrefix: !If [AutoCreateCloudTrail, !Sub "AWSLogs/${AWS::AccountId}/CloudTrail/", !Ref CloudTrailPrefix]
+                  ResolvedProtectedResources: !If
+                    - HasProtectedResource
+                    - !Sub '[{"identifier":"${ProtectedResourceIdentifier}","classification":"${ProtectedResourceClassification}","boundary":"${ProtectedResourceBoundary}"}]'
+                    - "[]"
           Secrets:
             - { Name: INWOM_BOOTSTRAP_TOKEN, ValueFrom: !Ref BootstrapSecret }
           HealthCheck:
