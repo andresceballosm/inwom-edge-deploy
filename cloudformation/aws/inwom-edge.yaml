@@ -364,8 +364,11 @@ Resources:
       Family: !Ref AWS::StackName
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
-      Cpu: "256"
-      Memory: "512"
+      # Diagnostic bump (was 256/512): testing whether the ~5min health-check crash loop is CPU
+      # starvation -- a fresh `python -m inwom_edge.health` subprocess competing with the main loop
+      # for a 0.25 vCPU allocation. Revert once we know either way.
+      Cpu: "512"
+      Memory: "1024"
       ExecutionRoleArn: !GetAtt ExecutionRole.Arn
       TaskRoleArn: !GetAtt TaskRole.Arn
       EphemeralStorage: { SizeInGiB: 21 }
@@ -411,8 +414,8 @@ Resources:
           HealthCheck:
             Command: [CMD, python, -m, inwom_edge.health]
             Interval: 60
-            Timeout: 10
-            Retries: 3
+            Timeout: 30
+            Retries: 5
             StartPeriod: 120
           LogConfiguration:
             LogDriver: awslogs
