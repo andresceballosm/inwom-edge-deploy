@@ -22,6 +22,10 @@ variable "bootstrap_token" {
   description = "Single-use registration token (expires 1 hour after creation). Stored in Secrets Manager; useless after the first successful registration."
   type        = string
   sensitive   = true
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]{32,256}$", var.bootstrap_token))
+    error_message = "bootstrap_token must be the exact URL-safe token from Inwom, without whitespace or a trailing newline."
+  }
 }
 
 variable "config_signing_public_keys" {

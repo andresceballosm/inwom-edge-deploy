@@ -62,6 +62,8 @@ resource "aws_ecs_task_definition" "edge" {
   memory                   = var.task_memory
   execution_role_arn       = aws_iam_role.execution.arn
   task_role_arn            = aws_iam_role.task.arn
+  enable_fault_injection   = false
+  tags                     = {}
 
   ephemeral_storage {
     size_in_gib = var.spool_size_gib
@@ -74,11 +76,13 @@ resource "aws_ecs_task_definition" "edge" {
 
   # Ephemeral, task-scoped volumes: nothing persists, nothing is shared.
   volume {
-    name = "spool"
+    name                = "spool"
+    configure_at_launch = false
   }
 
   volume {
-    name = "tmp"
+    name                = "tmp"
+    configure_at_launch = false
   }
 
   container_definitions = jsonencode([
@@ -89,12 +93,16 @@ resource "aws_ecs_task_definition" "edge" {
       # that and exits; "edge" waits for it (dependsOn SUCCESS) before starting. Found by a real
       # Fargate deployment: without it, health.beat()'s touch() fails silently (OSError swallowed
       # by design), the container health check never passes, and ECS kills the task every ~5min.
-      name       = "init-permissions"
-      image      = "${var.image_repository}@${var.image_digest}"
-      essential  = false
-      user       = "0:0"
-      entryPoint = ["sh", "-c"]
-      command    = ["chown -R 10001:10001 /tmp /spool"]
+      name           = "init-permissions"
+      image          = "${var.image_repository}@${var.image_digest}"
+      essential      = false
+      user           = "0:0"
+      entryPoint     = ["sh", "-c"]
+      command        = ["chown -R 10001:10001 /tmp /spool"]
+      environment    = []
+      portMappings   = []
+      systemControls = []
+      volumesFrom    = []
 
       mountPoints = [
         { sourceVolume = "spool", containerPath = "/spool", readOnly = false },
@@ -123,8 +131,12 @@ resource "aws_ecs_task_definition" "edge" {
 
       linuxParameters = {
         initProcessEnabled = true
-        capabilities       = { drop = ["ALL"] }
+        capabilities       = { add = [], drop = ["ALL"] }
       }
+
+      portMappings   = []
+      systemControls = []
+      volumesFrom    = []
 
       mountPoints = [
         { sourceVolume = "spool", containerPath = "/spool", readOnly = false },

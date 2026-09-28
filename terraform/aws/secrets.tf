@@ -10,4 +10,10 @@ resource "aws_secretsmanager_secret" "bootstrap" {
 resource "aws_secretsmanager_secret_version" "bootstrap" {
   secret_id     = aws_secretsmanager_secret.bootstrap.id
   secret_string = var.bootstrap_token
+
+  # The bootstrap token is intentionally single-use. Create it for first registration, then leave
+  # the stored (spent) value alone: the long-lived Edge identity is the non-exportable KMS key.
+  lifecycle {
+    ignore_changes = [secret_string]
+  }
 }
