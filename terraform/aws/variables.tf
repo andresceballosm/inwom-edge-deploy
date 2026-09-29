@@ -221,6 +221,12 @@ variable "max_privacy_mode" {
   }
 }
 
+variable "allow_session_lineage" {
+  description = "Allow schema 1.1 to export only the pseudonymous destination-session token created by a successful delegation. Disabled by default because it increases linkability; required for causal hand-off reconstruction."
+  type        = bool
+  default     = false
+}
+
 variable "forensic_allowed_fields" {
   description = "Per-source, per-field forensic allowlist, e.g. { CLOUDTRAIL = [\"SOURCE_IP\"] }. Empty = forensic export impossible, whatever Inwom Cloud requests."
   type        = map(list(string))

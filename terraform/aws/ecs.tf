@@ -13,7 +13,7 @@ resource "aws_ecs_cluster" "edge" {
 }
 
 locals {
-  local_policy = {
+  local_policy = merge({
     tenant_id        = var.inwom_tenant_id
     environment_id   = var.inwom_environment_id
     max_privacy_mode = var.max_privacy_mode
@@ -51,7 +51,12 @@ locals {
     durable_queue_url     = var.enable_durable_queue ? aws_sqs_queue.transport[0].url : null
     protected_resources   = var.protected_resources
     spool_max_bytes       = min(8589934592, floor(var.spool_size_gib * 1024 * 1024 * 1024 / 2)) # <= half the ephemeral disk, <= the Edge's 8 GiB validation cap
-  }
+    },
+    # Omit the additive field when disabled so a new deployment template remains
+    # compatible with pre-1.1 Edge images whose strict model does not know it.
+    # A signed cloud config must independently request schema 1.1.
+    var.allow_session_lineage ? { allow_session_lineage = true } : {}
+  )
 }
 
 resource "aws_ecs_task_definition" "edge" {
