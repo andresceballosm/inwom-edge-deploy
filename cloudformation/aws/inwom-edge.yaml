@@ -66,14 +66,14 @@ Parameters:
     Description: >-
       Any of CLOUDTRAIL, WAF, ALB, VPC_FLOW, GUARDDUTY, CLOUDWATCH, IAM_METADATA, COMPUTE_METADATA. A source is only read if
       it is listed here AND you granted its data location above (unknown values make the Edge refuse to start).
-  MaxPrivacyMode: { Type: String, Default: STRICT, AllowedValues: [STRICT, STANDARD] }
+  MaxPrivacyMode: { Type: String, Default: STANDARD, AllowedValues: [STRICT, STANDARD] }
   AllowSessionLineage:
     Type: String
-    Default: "false"
+    Default: "true"
     AllowedValues: ["true", "false"]
     Description: >-
-      Customer-owned opt-in for schema 1.1 pseudonymous delegation links. The signed Inwom
-      configuration must also request 1.1; enabling this ceiling alone changes no export.
+      Product baseline for schema 1.1 pseudonymous delegation links. The Edge advertises this
+      capability and Inwom automatically publishes the compatible signed configuration.
   LogRetentionDays: { Type: Number, Default: 30 }
   PermissionsBoundaryArn: { Type: String, Default: "" }
 

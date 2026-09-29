@@ -212,9 +212,9 @@ variable "enable_compute_metadata" {
 # ---- privacy ceiling (the signed config from Inwom can only narrow this) ----
 
 variable "max_privacy_mode" {
-  description = "STRICT (default): pseudonymous actors/resources + behavioural features + counters. STANDARD: adds sanitized action names, service, region, coarse network metadata, normalized error codes. FORENSIC: also requires forensic_allowed_fields."
+  description = "STANDARD (default): the minimum product baseline for automatic coordinated-attack reconstruction; identifiers remain pseudonymous. STRICT reduces telemetry and can limit reconstruction. FORENSIC also requires forensic_allowed_fields."
   type        = string
-  default     = "STRICT"
+  default     = "STANDARD"
   validation {
     condition     = contains(["STRICT", "STANDARD", "FORENSIC"], var.max_privacy_mode)
     error_message = "max_privacy_mode must be STRICT, STANDARD or FORENSIC."
@@ -222,9 +222,9 @@ variable "max_privacy_mode" {
 }
 
 variable "allow_session_lineage" {
-  description = "Allow schema 1.1 to export only the pseudonymous destination-session token created by a successful delegation. Disabled by default because it increases linkability; required for causal hand-off reconstruction."
+  description = "Allow schema 1.1 to export only the pseudonymous destination-session token created by a successful delegation. Enabled as the product baseline for automatic causal hand-off reconstruction; no role names, credentials, or payloads are exported."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "forensic_allowed_fields" {
