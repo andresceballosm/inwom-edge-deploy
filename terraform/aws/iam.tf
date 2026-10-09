@@ -131,6 +131,18 @@ data "aws_iam_policy_document" "task" {
     }
   }
 
+  dynamic "statement" {
+    for_each = var.enable_cloudtrail_streaming || length(var.additional_cloudtrail_queue_urls) > 0 ? [1] : []
+    content {
+      sid     = "CloudTrailInputQueuesOnly"
+      actions = ["sqs:ReceiveMessage", "sqs:DeleteMessage"]
+      resources = concat(
+        var.enable_cloudtrail_streaming ? [aws_sqs_queue.cloudtrail_input[0].arn] : [],
+        [for url in var.additional_cloudtrail_queue_urls : "arn:${local.partition}:sqs:${split(".", split("/", url)[2])[1]}:${split("/", url)[3]}:${split("/", url)[4]}"],
+      )
+    }
+  }
+
   statement {
     sid       = "PseudonymKeyDerivationOnly"
     actions   = ["kms:GenerateMac"]

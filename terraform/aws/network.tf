@@ -42,6 +42,7 @@ locals {
   interface_endpoints = var.create_vpc_endpoints ? toset(compact([
     "kms",
     "logs",
+    var.enable_cloudtrail_streaming || var.enable_durable_queue ? "sqs" : "",
     "secretsmanager",
     var.guardduty_detector_id != "" ? "guardduty" : "",
     var.ecr_repository_arn != null ? "ecr.api" : "",

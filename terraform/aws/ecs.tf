@@ -18,7 +18,7 @@ locals {
     environment_id   = var.inwom_environment_id
     max_privacy_mode = var.max_privacy_mode
     allowed_sources = concat(
-      (var.cloudtrail_bucket != "" || local.mirror) ? ["CLOUDTRAIL"] : [],
+      (var.cloudtrail_bucket != "" || local.mirror || var.enable_cloudtrail_streaming || length(var.additional_cloudtrail_queue_urls) > 0) ? ["CLOUDTRAIL"] : [],
       var.waf_bucket != "" ? ["WAF"] : [],
       var.alb_bucket != "" ? ["ALB"] : [],
       var.vpc_flow_bucket != "" ? ["VPC_FLOW"] : [],
@@ -31,7 +31,7 @@ locals {
     ingest_endpoint            = var.ingest_endpoint
     allowed_egress_hosts       = var.allowed_egress_hosts
     config_signing_public_keys = var.config_signing_public_keys
-    source_locations = {
+    source_locations = merge({
       cloudtrail_bucket     = var.cloudtrail_bucket == "" ? null : var.cloudtrail_bucket
       cloudtrail_prefixes   = var.cloudtrail_prefixes
       waf_bucket            = var.waf_bucket == "" ? null : var.waf_bucket
@@ -42,7 +42,9 @@ locals {
       vpc_flow_prefixes     = var.vpc_flow_prefixes
       guardduty_detector_id = var.guardduty_detector_id == "" ? null : var.guardduty_detector_id
       cloudwatch_log_groups = var.cloudwatch_log_group_names
-    }
+      }, var.enable_cloudtrail_streaming || length(var.additional_cloudtrail_queue_urls) > 0 ? {
+      cloudtrail_queue_urls = concat(var.enable_cloudtrail_streaming ? [aws_sqs_queue.cloudtrail_input[0].url] : [], var.additional_cloudtrail_queue_urls)
+    } : {})
     ca_bundle_pem         = var.ca_bundle_pem == "" ? null : var.ca_bundle_pem
     pseudonym_key_version = var.pseudonym_key_version
     kms_mac_key_id        = aws_kms_key.pseudonym.arn

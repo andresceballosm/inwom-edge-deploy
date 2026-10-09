@@ -58,6 +58,11 @@ Parameters:
   VpcFlowPrefix: { Type: String, Default: "" }
   GuardDutyDetectorId: { Type: String, Default: "" }
   CloudWatchLogGroupName: { Type: String, Default: "" }
+  EnableCloudTrailStreaming:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "EventBridge to dedicated SQS input in this Region. Requires a compatible Edge image and an active trail. Keeps S3 recovery."
   EnableIamMetadata: { Type: String, Default: "false", AllowedValues: ["true", "false"] }
   EnableComputeMetadata: { Type: String, Default: "false", AllowedValues: ["true", "false"] }
   EnabledSources:
@@ -78,6 +83,7 @@ Parameters:
   PermissionsBoundaryArn: { Type: String, Default: "" }
 
 Conditions:
+  CloudTrailStreaming: !Equals [!Ref EnableCloudTrailStreaming, "true"]
   HasOwnCloudTrailBucket: !Not [!Equals [!Ref CloudTrailBucket, ""]]
   AutoCreateCloudTrail: !And [!Equals [!Ref CloudTrailBucket, ""], !Equals [!Ref CreateCloudTrail, "true"]]
   HasCloudTrail: !Or [!Condition HasOwnCloudTrailBucket, !Condition AutoCreateCloudTrail]
@@ -94,6 +100,58 @@ Conditions:
   HasAnyS3: !Or [!Condition HasCloudTrail, !Condition HasWaf, !Condition HasAlb, !Condition HasVpcFlow]
 
 Resources:
+  CloudTrailInputDlq:
+    Type: AWS::SQS::Queue
+    Condition: CloudTrailStreaming
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns: [!Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-cloudtrail-input"]
+
+  CloudTrailInputQueue:
+    Type: AWS::SQS::Queue
+    Condition: CloudTrailStreaming
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-cloudtrail-input"
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CloudTrailInputDlq.Arn
+        maxReceiveCount: 10
+
+  CloudTrailInputQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: CloudTrailStreaming
+    Properties:
+      Queues: [!Ref CloudTrailInputQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt CloudTrailInputQueue.Arn
+            Condition:
+              ArnEquals: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${AWS::StackName}-cloudtrail-input" }
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+
+  CloudTrailInputRule:
+    Type: AWS::Events::Rule
+    Condition: CloudTrailStreaming
+    DependsOn: CloudTrailInputQueuePolicy
+    Properties:
+      Name: !Sub "${AWS::StackName}-cloudtrail-input"
+      State: ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
+      EventPattern:
+        account: [!Ref AWS::AccountId]
+        detail-type: ["AWS API Call via CloudTrail", "AWS Console Signin via CloudTrail", "AWS Console Action via CloudTrail", "AWS Service Event via CloudTrail"]
+      Targets:
+        - Id: edge-cloudtrail-input
+          Arn: !GetAtt CloudTrailInputQueue.Arn
+
   PseudonymKey:
     Type: AWS::KMS::Key
     Properties:
@@ -315,6 +373,13 @@ Resources:
                 Effect: Allow
                 Action: ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"]
                 Resource: !GetAtt TransportQueue.Arn
+              - !If
+                - CloudTrailStreaming
+                - Sid: CloudTrailInputQueueOnly
+                  Effect: Allow
+                  Action: ["sqs:ReceiveMessage", "sqs:DeleteMessage"]
+                  Resource: !GetAtt CloudTrailInputQueue.Arn
+                - !Ref "AWS::NoValue"
               - Sid: PseudonymKeyDerivationOnly
                 Effect: Allow
                 Action: ["kms:GenerateMac"]
@@ -417,7 +482,7 @@ Resources:
                   ${SessionLineageField}
                   "allowed_sources":["${Sources}"],"ingest_endpoint":"${IngestEndpoint}","allowed_egress_hosts":["${IngestHost}"],
                   "config_signing_public_keys":["${ConfigSigningPublicKey}"],"source_locations":{"cloudtrail_bucket":"${ResolvedCloudTrailBucket}",
-                  "cloudtrail_prefixes":["${ResolvedCloudTrailPrefix}"],"waf_bucket":"${WafBucket}","waf_prefixes":["${WafPrefix}"],
+                  "cloudtrail_prefixes":["${ResolvedCloudTrailPrefix}"],${CloudTrailQueueLocations}"waf_bucket":"${WafBucket}","waf_prefixes":["${WafPrefix}"],
                   "alb_bucket":"${AlbBucket}","alb_prefixes":["${AlbPrefix}"],"vpc_flow_bucket":"${VpcFlowBucket}",
                   "vpc_flow_prefixes":["${VpcFlowPrefix}"],"guardduty_detector_id":"${GuardDutyDetectorId}",
                   "cloudwatch_log_groups":["${CloudWatchLogGroupName}"]},"kms_mac_key_id":"${PseudonymKeyArn}",
@@ -425,6 +490,7 @@ Resources:
                   "durable_queue_url":"${QueueUrl}"}
                 - Sources: !Join ['","', !Ref EnabledSources]
                   SessionLineageField: !If [SessionLineageEnabled, '"allow_session_lineage":true,', ""]
+                  CloudTrailQueueLocations: !If [CloudTrailStreaming, !Sub '"cloudtrail_queue_urls":["${CloudTrailInputQueue}"],', ""]
                   PseudonymKeyArn: !GetAtt PseudonymKey.Arn
                   IdentityKeyArn: !GetAtt IdentityKey.Arn
                   QueueUrl: !Ref TransportQueue

@@ -30,3 +30,6 @@ output "queue_url" {
   description = "The Edge-owned transport queue (encrypted; the runtime role may act only on this queue)."
   value       = var.enable_durable_queue ? aws_sqs_queue.transport[0].url : null
 }
+output "cloudtrail_input_queue_url" {
+  value = var.enable_cloudtrail_streaming ? aws_sqs_queue.cloudtrail_input[0].url : null
+}
